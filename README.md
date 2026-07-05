@@ -246,6 +246,11 @@ You will notice that some scripts have similar names. That is intentional. I dev
 * tropical_surface_slp_wind_speed_mph_direction.py
 * tropical_surface_sst_degc_slp_wind_speed_dir.py
 * tropical_surface_sst_degf_slp_wind_speed_dir.py
+* tropical_hurricane_track.py
+
+<img width="1630" height="1334" alt="wrf_hurricane_track_d02_2026070500_to_2026070700_intensity" src="https://github.com/user-attachments/assets/eb998293-523c-4e72-b57e-8ec80cd627ea" />
+
+<img width="1583" height="1006" alt="wrf_hurricane_track_d02_2026070500_to_2026070700_map" src="https://github.com/user-attachments/assets/4c55bcaa-b911-4b17-9d99-7ee32d22db79" />
 
 <img width="2210" height="1851" alt="wrf_d02_SLP_WIND_TEMP" src="https://github.com/user-attachments/assets/0831cdfc-1e91-4375-88bd-c75909ee73d4" />
 
