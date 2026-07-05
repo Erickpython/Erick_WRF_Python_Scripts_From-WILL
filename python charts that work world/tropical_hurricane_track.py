@@ -1798,7 +1798,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "domain",
-        help="WRF domain to track first, such as d01, d02, or d03.",
+        help=(
+            "WRF domain to track first, such as d01, d02, or d03. "
+            "Backward-compatible wrapper calls may pass the WRF run directory here "
+            "and the domain as the next positional argument."
+        ),
+    )
+
+    parser.add_argument(
+        "legacy_domain",
+        nargs="?",
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -1946,12 +1956,54 @@ def make_output_stem(domain: str, df: pd.DataFrame) -> str:
     return f"wrf_hurricane_track_{safe_tag(domain)}_{start}_to_{end}"
 
 
+def is_wrf_domain(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    return re.fullmatch(r"d\d+", value.strip().lower()) is not None
+
+
+def normalize_cli_arguments(args: argparse.Namespace) -> argparse.Namespace:
+    """
+    Support both command styles:
+
+        python3 tropical_hurricane_track.py d02 --wrf-dir /path/to/WRF/run
+        python3 tropical_hurricane_track.py /path/to/WRF/run d02
+
+    The second form matches the existing wrapper convention used by the other
+    WRF plotting scripts: <script> <wrf_run_dir> <domain>.
+    """
+    if args.legacy_domain is not None:
+        first_arg = str(args.domain)
+        second_arg = str(args.legacy_domain)
+
+        if is_wrf_domain(second_arg):
+            args.wrf_dir = first_arg
+            args.domain = second_arg
+        else:
+            raise SystemExit(
+                "ERROR: When two positional arguments are used, the second one "
+                "must be a WRF domain such as d01, d02, or d03. "
+                "Expected either: tropical_hurricane_track.py d02 --wrf-dir /path/to/run "
+                "or: tropical_hurricane_track.py /path/to/run d02"
+            )
+
+    args.domain = str(args.domain).lower()
+
+    if not is_wrf_domain(args.domain):
+        raise SystemExit(
+            "ERROR: Domain must look like d01, d02, or d03. "
+            f"Received: {args.domain!r}"
+        )
+
+    return args
+
+
 ###############################################################################
 # Main
 ###############################################################################
 def main() -> None:
-    args = build_arg_parser().parse_args()
-    args.domain = args.domain.lower()
+    args = normalize_cli_arguments(build_arg_parser().parse_args())
 
     if args.init_lat is not None and args.init_lon is None:
         raise SystemExit("ERROR: --init-lat requires --init-lon.")
