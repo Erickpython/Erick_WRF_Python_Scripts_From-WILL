@@ -22,6 +22,16 @@ declare -A locations=(
 ["Houston, TX"]="29.7604,-95.3698"  # Houston, largest city in Texas
 ["Dallas, TX"]="32.7767,-96.7970"   # Dallas, major city in North Texas
 )
+###############################################################################
+# WRF-native trajectory settings
+###############################################################################
+# These can be overridden from the command line, for example:
+#   TRAJECTORY_HEIGHT_LEVELS="10,50,100,250,500,750,1000,1500,2000,2500,3000,4000,5000" ./this_script.sh
+ENABLE_TRAJECTORIES="${ENABLE_TRAJECTORIES:-1}"
+# Standard trajectory starting heights in meters AGL:
+# near-surface, boundary-layer, lower-tropospheric, and elevated transport levels.
+TRAJECTORY_HEIGHT_LEVELS="${TRAJECTORY_HEIGHT_LEVELS:-50, 100, 500, 1000, 2500, 5000}"
+TRAJECTORY_DT_MIN="${TRAJECTORY_DT_MIN:-60}"
 
 
 
@@ -155,6 +165,95 @@ run_meteogram() {
 }
 
 ###############################################################################
+# WRF-native trajectory scripts
+# These use the same point locations defined above and run on d02 by default. for each selected location
+###############################################################################
+run_trajectory_script() {
+  local domain="$1"
+  local trajectory_script="$2"
+  local label="$3"
+
+  if [[ ! -f "$script_dir/$trajectory_script" ]]; then
+    echo "WARNING: missing trajectory script '$script_dir/$trajectory_script' — skipping $label"
+    return 0
+  fi
+
+  if [[ ${#locations[@]} -eq 0 ]]; then
+    echo "WARNING: no point locations are defined, skipping $label trajectories for $domain"
+    return 0
+  fi
+
+  for location in "${!locations[@]}"; do
+    local lat_long="${locations[$location]}"
+    local lat long
+    lat=$(echo "$lat_long" | cut -d',' -f1)
+    long=$(echo "$lat_long" | cut -d',' -f2)
+
+    local out_dir="$parent_folder/$domain/$location/trajectories/$label"
+    mkdir -p "$out_dir" || { echo "Failed to create directory $out_dir"; exit 1; }
+    cd "$out_dir" || { echo "Failed to cd into $out_dir"; exit 1; }
+
+    echo "Running $trajectory_script for $location in $domain (lat=$lat lon=$long)"
+    echo "  Heights: $TRAJECTORY_HEIGHT_LEVELS m AGL"
+    echo "  Time step: $TRAJECTORY_DT_MIN minutes"
+
+    python3 "$script_dir/$trajectory_script" \
+      "$domain" "$location" "$lat" "$long" \
+      --wrf-dir "$run_location" \
+      --height-levels-m "$TRAJECTORY_HEIGHT_LEVELS" \
+      --dt-min "$TRAJECTORY_DT_MIN" \
+      --out-dir "." 2>&1 || {
+        echo "$trajectory_script failed for $location in $domain"
+        exit 1
+      }
+
+    cd "$script_dir" || { echo "Failed to cd back to $script_dir"; exit 1; }
+  done
+}
+
+run_back_trajectory() {
+  local domain="$1"
+  run_trajectory_script "$domain" "WRF_Back_Trajectory.py" "back"
+}
+
+run_forward_trajectory() {
+  local domain="$1"
+  run_trajectory_script "$domain" "WRF_Forward_Trajectory.py" "forward"
+}
+
+run_back_forward_trajectory() {
+  local domain="$1"
+  run_trajectory_script "$domain" "WRF_Back_Forward_Trajectory.py" "back_forward"
+}
+
+run_all_trajectories() {
+  local domain="$1"
+  run_back_trajectory "$domain"
+  run_forward_trajectory "$domain"
+  run_back_forward_trajectory "$domain"
+}
+
+run_d02_trajectories() {
+  if [[ "$ENABLE_TRAJECTORIES" != "1" ]]; then
+    echo "Skipping WRF-native trajectory scripts because ENABLE_TRAJECTORIES=$ENABLE_TRAJECTORIES"
+    return 0
+  fi
+
+  if [[ ${#locations[@]} -eq 0 ]]; then
+    echo "WARNING: no point locations are defined in this script, skipping d02 trajectories"
+    return 0
+  fi
+
+  echo "Running WRF-native trajectory scripts for the locations defined in this script."
+  echo "  Domain: d02"
+  echo "  Locations: ${!locations[*]}"
+  echo "  Heights: $TRAJECTORY_HEIGHT_LEVELS m AGL"
+  echo "  Time step: $TRAJECTORY_DT_MIN minutes"
+
+  run_all_trajectories "d02"
+}
+
+###############################################################################
 # Find WRF /run directory
 ###############################################################################
 find_wrf_run_directories() {
@@ -192,8 +291,7 @@ mkdir -p "$parent_folder"
 
 find_wrf_run_directories
 
-# Point charts for domain d02
-echo "Running point-based Python charts for domain d02."
+echo "Running point-based Python charts for domain."
 sleep 5
 run_meteogram "d02"
 sleep 5
@@ -202,6 +300,11 @@ sleep 5
 run_vertical_wind "d02"
 sleep 5
 run_vertical_wind_4km "d02"
+
+
+echo "Running WRF-native trajectory scripts for selected locations."
+sleep 5
+run_d02_trajectories
 
 ###############################################################################
 # Scripts to run in parallel for domain d01

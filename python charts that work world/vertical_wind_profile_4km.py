@@ -322,21 +322,125 @@ cities = gpd.read_file(
 # (Retained verbatim as provided; imports are above in v9 order.)
 
 
+
+
+class PointOutsideMovingNestError(RuntimeError):
+    """Raised when the requested lat/lon is outside the moving nest for a frame."""
+
+
+def ll_to_xy_moving_safe(nc, lat, lon, time_index, sample_da, ncfile_path=""):
+    """
+    Convert lat/lon to x/y for the current frame of a moving nest.
+
+    This intentionally uses timeidx=time_index. It also checks the returned
+    indices against the current frame's grid shape so a point outside the
+    moving nest can be skipped cleanly instead of crashing or sampling the
+    wrong static column.
+    """
+    xy = ll_to_xy(nc, lat, lon, timeidx=time_index, meta=False)
+    x_idx = int(xy[0])
+    y_idx = int(xy[1])
+
+    arr = to_np(sample_da)
+    ny, nx = arr.shape[-2], arr.shape[-1]
+
+    if x_idx < 0 or x_idx >= nx or y_idx < 0 or y_idx >= ny:
+        raise PointOutsideMovingNestError(
+            f"lat={lat:.4f}, lon={lon:.4f} is outside grid "
+            f"for {os.path.basename(ncfile_path)} time_index={time_index} "
+            f"(x={x_idx}, y={y_idx}, nx={nx}, ny={ny})"
+        )
+
+    return x_idx, y_idx
+
+
+def derive_pressure_height_mapping(frames, lat, lon, p_levels_all):
+    """
+    Build the pressure-to-height reference mapping from the first frame that
+    actually contains the requested point.
+
+    Moving nests may not cover the point at the first file/time. This routine
+    searches forward until the point is inside the nest, then uses that frame as
+    the reference for the vertical axis mapping.
+    """
+    skipped = 0
+
+    for ncfile_path, time_index in frames:
+        with Dataset(ncfile_path) as nc:
+            valid_dt = get_valid_time(nc, ncfile_path, time_index)
+            p_da = getvar(nc, "pres", timeidx=time_index, units="hPa")
+            z_da = getvar(nc, "height_agl", timeidx=time_index, units="m")
+
+            try:
+                x_idx, y_idx = ll_to_xy_moving_safe(
+                    nc, lat, lon, time_index, p_da, ncfile_path
+                )
+            except PointOutsideMovingNestError as exc:
+                skipped += 1
+                print(f"SKIP reference frame: {exc}")
+                continue
+
+            p_prof0 = to_np(p_da[:, y_idx, x_idx]).astype(float)
+            z_prof0 = to_np(z_da[:, y_idx, x_idx]).astype(float)
+
+            pmin = min(p_prof0.min(), p_prof0.max())
+            pmax = max(p_prof0.min(), p_prof0.max())
+            mask = (p_levels_all >= pmin) & (p_levels_all <= pmax)
+            p_levels = p_levels_all[mask]
+
+            if p_levels.size == 0:
+                skipped += 1
+                print(
+                    "SKIP reference frame: no requested pressure levels within "
+                    f"model range for {os.path.basename(ncfile_path)} "
+                    f"time_index={time_index}"
+                )
+                continue
+
+            sort_p = np.argsort(p_prof0)
+            p_sorted = p_prof0[sort_p]
+            z_sorted = z_prof0[sort_p]
+            z_levels = np.interp(p_levels, p_sorted, z_sorted)
+
+            sort_z = np.argsort(z_levels)
+            z_levels = z_levels[sort_z]
+            p_levels = p_levels[sort_z]
+
+            print(
+                "Using "
+                f"{ncfile_path} time_index={time_index} "
+                f"({valid_dt:%Y/%m/%d %H:%M:%S} UTC) "
+                "to derive standard pressure→height mapping."
+            )
+            if skipped:
+                print(f"Skipped {skipped} earlier reference frame(s).")
+
+            return p_levels, z_levels
+
+    raise RuntimeError(
+        "The requested lat/lon was not inside the moving nest for any frame, "
+        "or no usable pressure levels were available."
+    )
+
 # =============================================================================
 # PER-FILE PROCESSING FUNCTION (RUNS IN EACH WORKER PROCESS)
 # =============================================================================
 def process_frame(args):
     """
     Worker function that interpolates U and V winds to standard pressure levels
-    (limited to ≤ 4 km AGL subset as requested) for a single WRF output file.
-    Designed to be called from a ProcessPoolExecutor worker process.
+    for a single (file, time_index) frame.
+
+    Moving-nest safety:
+        * Converts the requested lat/lon to x/y with timeidx=time_index.
+        * Skips frames where the point is outside the moving nest.
+        * Keeps the original ≤ 4 km subset behavior.
     """
     (
         wrf_file,
         time_index,
         domain,
-        x_idx,
-        y_idx,
+        lat,
+        lon,
         p_levels,
         mask_4km,
     ) = args
@@ -349,6 +453,14 @@ def process_frame(args):
         p_da = getvar(nc, "pres", timeidx=time_index, units="hPa")
         u_da = getvar(nc, "ua", timeidx=time_index, units="kt")
         v_da = getvar(nc, "va", timeidx=time_index, units="kt")
+
+        try:
+            x_idx, y_idx = ll_to_xy_moving_safe(
+                nc, lat, lon, time_index, p_da, wrf_file
+            )
+        except PointOutsideMovingNestError as exc:
+            print(f"SKIP frame: {exc}")
+            return None
 
         p_prof = to_np(p_da[:, y_idx, x_idx]).astype(float)
         u_prof = to_np(u_da[:, y_idx, x_idx]).astype(float)
@@ -428,71 +540,43 @@ def main():
     print(f"Found {len(wrf_files)} WRF files.")
 
     # -------------------------------------------------------------------
-    # STEP 1: Define standard pressure levels and map them to height
-    #         using the first file (reference sounding)
+    # STEP 1: Discover frames, then derive standard pressure→height mapping
+    #         from the first frame that contains the requested lat/lon.
     # -------------------------------------------------------------------
-    first_file = wrf_files[0]
-    print(f"Using {first_file} to derive standard pressure→height mapping.")
+    frames = discover_frames(wrf_files)
+    if not frames:
+        print("No timesteps found in provided WRF files.")
+        sys.exit(0)
 
-    with Dataset(first_file) as nc:
-        x_idx, y_idx = ll_to_xy(nc, lat, lon, meta=False)
+    p_levels_all = np.array(
+        [
+            1013,
+            1000,
+            950,
+            900,
+            850,
+            800,
+            750,
+            700,
+            650,
+            600,
+            550,
+            500,
+            450,
+            400,
+            350,
+            300,
+            250,
+            200,
+            150,
+            100,
+        ],
+        dtype=float,
+    )
 
-        # Pressure and height AGL at the chosen grid point
-        p_da = getvar(nc, "pres", timeidx=0, units="hPa")
-        z_da = getvar(nc, "height_agl", timeidx=0, units="m")
-
-        p_prof0 = to_np(p_da[:, y_idx, x_idx]).astype(float)
-        z_prof0 = to_np(z_da[:, y_idx, x_idx]).astype(float)
-
-        # Standard pressure levels of interest
-        p_levels_all = np.array(
-            [
-                1013,
-                1000,
-                950,
-                900,
-                850,
-                800,
-                750,
-                700,
-                650,
-                600,
-                550,
-                500,
-                450,
-                400,
-                350,
-                300,
-                250,
-                200,
-                150,
-                100,
-            ],
-            dtype=float,
-        )
-
-        # Keep only those within the model's pressure range
-        pmin = min(p_prof0.min(), p_prof0.max())
-        pmax = max(p_prof0.min(), p_prof0.max())
-        mask = (p_levels_all >= pmin) & (p_levels_all <= pmax)
-        p_levels = p_levels_all[mask]
-
-        if p_levels.size == 0:
-            raise RuntimeError(
-                "None of the requested pressure levels are within the model range."
-            )
-
-        # Interpolate height at the standard pressure levels
-        sort_p = np.argsort(p_prof0)
-        p_sorted = p_prof0[sort_p]
-        z_sorted = z_prof0[sort_p]
-
-        z_levels = np.interp(p_levels, p_sorted, z_sorted)
-
-        # Sort by height ascending, carry pressure along
-        sort_z = np.argsort(z_levels)
-        z_levels = z_levels[sort_z]
-        p_levels = p_levels[sort_z]
+    p_levels, z_levels = derive_pressure_height_mapping(
+        frames, lat, lon, p_levels_all
+    )
 
     # Limit to heights ≤ 4000 m
     MAX_HEIGHT = 4000.0  # meters
@@ -527,24 +611,34 @@ def main():
     u_list = []
     v_list = []
 
-    frames = discover_frames(wrf_files)
-    if not frames:
-        print("No timesteps found in provided WRF files.")
-        sys.exit(0)
-
     tasks = [
-        (wrf_file, time_index, domain, x_idx, y_idx, p_levels, mask_4km)
+        (wrf_file, time_index, domain, lat, lon, p_levels, mask_4km)
         for (wrf_file, time_index) in frames
     ]
 
     max_workers = min(4, len(tasks)) if tasks else 1
 
     # Use a ProcessPoolExecutor with a fixed pool size of 4 worker processes
+    results = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        for dt, u_std, v_std in executor.map(process_frame, tasks):
-            times.append(dt)
-            u_list.append(u_std)
-            v_list.append(v_std)
+        for res in executor.map(process_frame, tasks):
+            results.append(res)
+
+    for res in results:
+        if res is None:
+            continue
+        dt, u_std, v_std = res
+        times.append(dt)
+        u_list.append(u_std)
+        v_list.append(v_std)
+
+    if not times:
+        print("No valid frames contained the requested point. No plot created.")
+        sys.exit(0)
+
+    skipped_frames = len(results) - len(times)
+    if skipped_frames:
+        print(f"Skipped {skipped_frames} frame(s) where the point was outside the moving nest.")
 
     times = np.array(times)
     u_levels = np.array(u_list)

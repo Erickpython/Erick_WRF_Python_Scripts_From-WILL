@@ -16,6 +16,10 @@ Structural v3 updates:
   * Valid time from WRF metadata (wrf.extract_times), filename as fallback
   * PNG filenames use YYYYMMDDHHMMSS timestamps for GIF ordering
 
+Moving-nest safety updates:
+  * Lat/lon to grid-column lookup uses timeidx=time_index.
+  * Frames are skipped cleanly when the requested point is outside a moving nest.
+
 All meteorological computations, indices, and precip-type logic are unchanged.
 """
 
@@ -466,6 +470,10 @@ def ensure_directories_exist(*dirs):
     for d in dirs:
         if not os.path.isdir(d):
             os.mkdir(d)
+
+
+class PointOutsideMovingNestError(RuntimeError):
+    """Raised when the requested lat/lon is outside this frame's moving domain."""
 
 
 # =============================================================================
@@ -1411,15 +1419,33 @@ except Exception as e:
 
 
 def extract_vertical_profiles(wrf_handle, point_lat, point_lon, time_index):
-    """Extract vertical column at given lat/lon from a WRF output file."""
-    xy_idx = wrf.ll_to_xy(wrf_handle, point_lat, point_lon)
+    """
+    Extract vertical column at a lat/lon from one WRF timestep.
 
+    Moving-nest note
+    ----------------
+    Vortex-following and moving nests can change their lat/lon grid every
+    timestep, so ll_to_xy must receive timeidx=time_index. The returned x/y
+    is then bounds-checked against this timestep's 2D field before sampling.
+    """
     p3 = wrf.getvar(wrf_handle, "pres", timeidx=time_index, units="hPa")
     t3 = wrf.getvar(wrf_handle, "temp", timeidx=time_index, units="degC")
     td3 = wrf.getvar(wrf_handle, "td", timeidx=time_index, units="degC")
     u3 = wrf.getvar(wrf_handle, "ua", timeidx=time_index, units="kt")
     v3 = wrf.getvar(wrf_handle, "va", timeidx=time_index, units="kt")
     z3 = wrf.getvar(wrf_handle, "height_agl", timeidx=time_index, units="m")
+
+    # Find the grid column for this specific timestep. This is the key
+    # moving-nest/vortex-following fix compared with a static-domain script.
+    xy_idx = wrf.ll_to_xy(wrf_handle, point_lat, point_lon, timeidx=time_index)
+    x, y = int(xy_idx[0]), int(xy_idx[1])
+
+    ny, nx = p3.shape[-2], p3.shape[-1]
+    if x < 0 or x >= nx or y < 0 or y >= ny:
+        raise PointOutsideMovingNestError(
+            f"point lat={point_lat}, lon={point_lon} maps to x={x}, y={y}, "
+            f"outside this timestep's domain bounds nx={nx}, ny={ny}"
+        )
 
     try:
         qr3 = wrf.getvar(wrf_handle, "QRAIN", timeidx=time_index)
@@ -1438,19 +1464,17 @@ def extract_vertical_profiles(wrf_handle, point_lat, point_lon, time_index):
     except Exception:
         qi3 = None
 
-    j, i = xy_idx[1], xy_idx[0]
-
-    prs_profile = p3[:, j, i].values * units.hectopascal
-    temp_profile = t3[:, j, i].values * units.degC
-    dew_profile = td3[:, j, i].values * units.degC
-    u_profile = u3[:, j, i].values * units.knot
-    v_profile = v3[:, j, i].values * units.knot
-    z_profile = z3[:, j, i].values * units.meter
+    prs_profile = p3[:, y, x].values * units.hectopascal
+    temp_profile = t3[:, y, x].values * units.degC
+    dew_profile = td3[:, y, x].values * units.degC
+    u_profile = u3[:, y, x].values * units.knot
+    v_profile = v3[:, y, x].values * units.knot
+    z_profile = z3[:, y, x].values * units.meter
 
     def _extract_q(q3):
         if q3 is None:
             return None
-        return q3[:, j, i].values
+        return q3[:, y, x].values
 
     qr_profile = _extract_q(qr3)
     qs_profile = _extract_q(qs3)
@@ -1485,7 +1509,6 @@ def extract_vertical_profiles(wrf_handle, point_lat, point_lon, time_index):
         qg_profile,
         qi_profile,
     )
-
 
 # =============================================================================
 # PANEL DRAWING HELPERS (unchanged)
@@ -2908,6 +2931,22 @@ def process_frame(args):
         plt.close(fig)
         return output_path
 
+    except PointOutsideMovingNestError as e:
+        valid_msg = "unknown time"
+        try:
+            valid_msg = get_valid_time(wrf_handle, ncfile_path, time_index).strftime(
+                "%Y/%m/%d %H:%M:%S UTC"
+            )
+        except Exception:
+            pass
+        print(
+            f"SKIP {os.path.basename(ncfile_path)} (t={time_index}, {valid_msg}): {e}"
+        )
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
     except Exception as e:
         print(f"ERROR in {os.path.basename(ncfile_path)} (t={time_index}): {e}")
         try:
@@ -3019,10 +3058,15 @@ def main():
     max_workers = min(4, len(args_list)) if args_list else 1
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        for _ in executor.map(process_frame, args_list):
-            pass
+        rendered_files = list(executor.map(process_frame, args_list))
 
-    create_gif(path_figures, image_folder, domain)
+    rendered_files = [path for path in rendered_files if path is not None]
+    print(f"Rendered {len(rendered_files)} of {len(args_list)} requested frames.")
+
+    if rendered_files:
+        create_gif(path_figures, image_folder, domain)
+    else:
+        print("No frames were rendered, so GIF creation was skipped.")
 
 
 if __name__ == "__main__":

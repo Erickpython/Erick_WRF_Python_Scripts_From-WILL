@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Meteogram_DegC_multicore_v3.py
+Meteogram_DegC_moving_nest_fixed.py
 
 Generates a multi-panel meteogram (metric units) from WRF output:
 1. Sea Level Pressure
@@ -162,6 +162,80 @@ def wind_direction_to_cardinal(degrees):
     return closest_dir
 
 
+
+###############################################################################
+# Moving-nest point lookup helpers
+###############################################################################
+def get_domain_shape(ncfile: Dataset):
+    """Return unstaggered WRF horizontal shape as (ny, nx)."""
+    ny = len(ncfile.dimensions["south_north"])
+    nx = len(ncfile.dimensions["west_east"])
+    return ny, nx
+
+
+def moving_nest_ll_to_xy(ncfile: Dataset, latitude: float, longitude: float, time_index: int):
+    """
+    Convert a fixed lat/lon to the nearest unstaggered grid point for this
+    timestep. This is the critical moving-nest step: the same lat/lon can map
+    to a different i/j location as the nest moves.
+    """
+    xy_loc = ll_to_xy(
+        ncfile,
+        latitude,
+        longitude,
+        timeidx=time_index,
+        as_int=True,
+        meta=False,
+    )
+
+    x = int(xy_loc[0])
+    y = int(xy_loc[1])
+
+    ny, nx = get_domain_shape(ncfile)
+    if x < 0 or x >= nx or y < 0 or y >= ny:
+        return None
+
+    return x, y
+
+
+def safe_diff_rate(current_value, previous_value, current_time, previous_time):
+    """
+    Convert a cumulative-value difference into an hourly rate.
+
+    For hourly WRF output this returns the original frame-to-frame difference.
+    For 5, 15, or 30 minute output this normalizes the value to units per hour.
+    Negative differences are treated as zero, which protects against restarts,
+    cumulative-field resets, and occasional moving-nest nearest-grid jumps.
+    """
+    if previous_value is None or previous_time is None:
+        return 0.0
+
+    delta_hours = (current_time - previous_time).total_seconds() / 3600.0
+    if delta_hours <= 0.0:
+        return 0.0
+
+    increment = current_value - previous_value
+    if increment < 0.0:
+        increment = 0.0
+
+    return increment / delta_hours
+
+
+def median_time_step_days(time_points):
+    """Return a plotting bar width in Matplotlib date units, adapted to timestep."""
+    if len(time_points) < 2:
+        return 0.02
+
+    time_nums = mdates.date2num(time_points)
+    diffs = np.diff(np.sort(time_nums))
+    diffs = diffs[diffs > 0.0]
+
+    if len(diffs) == 0:
+        return 0.02
+
+    return max(0.003, min(0.03, float(np.median(diffs)) * 0.60))
+
+
 ###############################################################################
 # Worker: extract meteogram sample for one (file, time_index) frame
 ###############################################################################
@@ -170,94 +244,104 @@ def process_frame(args):
     Reads a single (file, time_index) from a WRF output file and extracts
     point data at the given latitude/longitude.
 
-    Returns instantaneous values; rates (rain/snow) are computed later
-    from time differences.
+    Moving-nest behavior:
+        * Converts lat/lon to x/y using the current time_index.
+        * Checks bounds for the current moving domain.
+        * Returns None when the requested point is outside the moving nest
+          instead of stopping the entire meteogram.
     """
     ncfile_path, time_index, latitude, longitude = args
 
-    ncfile = Dataset(ncfile_path)
+    with Dataset(ncfile_path) as ncfile:
+        # Valid time from metadata (preferred) or filename
+        valid_dt = get_valid_time(ncfile, ncfile_path, time_index)
+        print(f"Extracting meteogram data: {valid_dt:%Y/%m/%d %H:%M:%S} UTC")
 
-    # Valid time from metadata (preferred) or filename
-    valid_dt = get_valid_time(ncfile, ncfile_path, time_index)
-    print(f"Extracting meteogram data: {valid_dt:%Y/%m/%d %H:%M:%S} UTC")
+        # ------------------------------------------------------------------
+        # Find grid indices for the given latitude and longitude.
+        # This MUST use timeidx for moving/vortex-following nests.
+        # ------------------------------------------------------------------
+        try:
+            xy = moving_nest_ll_to_xy(ncfile, latitude, longitude, time_index)
+        except Exception as e:
+            print(
+                f"Skipping {valid_dt:%Y-%m-%d %H:%M:%S} UTC: "
+                f"could not locate lat={latitude}, lon={longitude} "
+                f"in {os.path.basename(ncfile_path)}: {e}"
+            )
+            return None
+
+        if xy is None:
+            print(
+                f"Skipping {valid_dt:%Y-%m-%d %H:%M:%S} UTC: "
+                f"lat={latitude}, lon={longitude} is outside the moving "
+                f"{os.path.basename(ncfile_path)} domain."
+            )
+            return None
+
+        x, y = xy
+
+        # ------------------------------------------------------------------
+        # Extract required variables from the WRF file.
+        # ------------------------------------------------------------------
+        try:
+            # 2m Temperature in °C (T2 is K in WRF)
+            temp = float(wrf.getvar(ncfile, "T2", timeidx=time_index)[y, x] - 273.15)
+
+            # 2m Dew Point in °C
+            dew_point = float(wrf.getvar(ncfile, "td2", timeidx=time_index)[y, x])
+
+            # 2m Relative Humidity in %
+            rh2 = float(wrf.getvar(ncfile, "rh2", timeidx=time_index)[y, x])
+
+            # Sea level pressure (hPa)
+            pressure = float(wrf.getvar(ncfile, "slp", timeidx=time_index)[y, x])
+
+            # Solar radiation (W/m²)
+            solar_rad = float(wrf.getvar(ncfile, "SWDOWN", timeidx=time_index)[y, x])
+
+            # Cumulative rainfall (mm)
+            rain = float(
+                wrf.getvar(ncfile, "RAINC", timeidx=time_index)[y, x]
+                + wrf.getvar(ncfile, "RAINNC", timeidx=time_index)[y, x]
+                + wrf.getvar(ncfile, "RAINSH", timeidx=time_index)[y, x]
+            )
+
+            # 10m wind components (m/s)
+            wind_u = float(wrf.getvar(ncfile, "U10", timeidx=time_index)[y, x])
+            wind_v = float(wrf.getvar(ncfile, "V10", timeidx=time_index)[y, x])
+            wind_speed = float(np.sqrt(wind_u**2 + wind_v**2))
+            wind_direction = float(calculate_wind_direction(wind_u, wind_v))
+
+            # Cumulative snow water equivalent (mm), multiplied by 10
+            snowh20 = float(wrf.getvar(ncfile, "SNOW", timeidx=time_index)[y, x] * 10.0)
+
+        except KeyError as e:
+            raise RuntimeError(
+                f"Variable {e} not found in WRF file {ncfile_path} "
+                f"at time_index={time_index}."
+            )
 
     # ----------------------------------------------------------------------
-    # Find grid indices for the given latitude and longitude
-    # Use timeidx=time_index for moving/vortex-following nests safety
+    # Ensure that Td <= T when RH is 100%.
     # ----------------------------------------------------------------------
-    try:
-        xy_loc = ll_to_xy(ncfile, latitude, longitude, timeidx=time_index)
-        x, y = int(xy_loc[0]), int(xy_loc[1])
-    except Exception as e:
-        ncfile.close()
-        print(
-            f"Error finding grid indices for latitude {latitude}, "
-            f"longitude {longitude} in {ncfile_path}: {e}"
-        )
-        # Propagate error to main
-        raise
-
-    # ----------------------------------------------------------------------
-    # Extract required variables from the WRF file (physics unchanged)
-    # ----------------------------------------------------------------------
-    try:
-        # 2m Temperature in °C (T2 is K in WRF)
-        temp = wrf.getvar(ncfile, "T2", timeidx=time_index)[y, x] - 273.15
-
-        # 2m Dew Point in °C
-        dew_point = wrf.getvar(ncfile, "td2", timeidx=time_index)[y, x]
-
-        # 2m Relative Humidity in %
-        rh2 = wrf.getvar(ncfile, "rh2", timeidx=time_index)[y, x]
-
-        # Sea level pressure (hPa)
-        pressure = wrf.getvar(ncfile, "slp", timeidx=time_index)[y, x]
-
-        # Solar radiation (W/m²)
-        solar_rad = wrf.getvar(ncfile, "SWDOWN", timeidx=time_index)[y, x]
-
-        # Cumulative rainfall (mm)
-        rain = (
-            wrf.getvar(ncfile, "RAINC", timeidx=time_index)[y, x]
-            + wrf.getvar(ncfile, "RAINNC", timeidx=time_index)[y, x]
-            + wrf.getvar(ncfile, "RAINSH", timeidx=time_index)[y, x]
-        )
-
-        # 10m wind components (m/s)
-        wind_u = wrf.getvar(ncfile, "U10", timeidx=time_index)[y, x]
-        wind_v = wrf.getvar(ncfile, "V10", timeidx=time_index)[y, x]
-        wind_speed = np.sqrt(wind_u**2 + wind_v**2)
-        wind_direction = calculate_wind_direction(wind_u, wind_v)  # in degrees
-
-        # Cumulative snow water equivalent (mm), multiplied by 10
-        snowh20 = wrf.getvar(ncfile, "SNOW", timeidx=time_index)[y, x] * 10.0
-
-    except KeyError as e:
-        ncfile.close()
-        print(f"Variable {e} not found in the WRF file {ncfile_path}.")
-        raise
-    finally:
-        ncfile.close()
-
-    # ----------------------------------------------------------------------
-    # Ensure that Td <= T when RH is 100% (keep original physical tweak)
-    # ----------------------------------------------------------------------
-    if dew_point > temp and rh2 == 100:
+    if dew_point > temp and rh2 >= 99.9:
         dew_point = temp
 
-    # Return instantaneous values; rates will be computed later
+    # Return instantaneous values; rates will be computed later.
     return (
         valid_dt,
-        float(temp),
-        float(dew_point),
-        float(rh2),
-        float(pressure),
-        float(solar_rad),
-        float(rain),
-        float(wind_speed),
-        float(wind_direction),
-        float(snowh20),
+        temp,
+        dew_point,
+        rh2,
+        pressure,
+        solar_rad,
+        rain,
+        wind_speed,
+        wind_direction,
+        snowh20,
     )
+
 
 
 ###############################################################################
@@ -297,7 +381,7 @@ if __name__ == "__main__":
     # ----------------------------------------------------------------------
     if len(sys.argv) != 6:
         print(
-            "Usage: python Meteogram_DegC_multicore_v3.py "
+            "Usage: python Meteogram_DegC_moving_nest_fixed.py "
             "<path_to_WRF> <domain> <city> <latitude> <longitude>"
         )
         sys.exit(1)
@@ -342,7 +426,16 @@ if __name__ == "__main__":
     max_workers = min(4, len(args_list)) if args_list else 1
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        results = list(executor.map(process_frame, args_list))
+        raw_results = list(executor.map(process_frame, args_list))
+
+    skipped_frames = sum(result is None for result in raw_results)
+    results = [result for result in raw_results if result is not None]
+
+    if skipped_frames:
+        print(
+            f"Skipped {skipped_frames} frame(s) because the requested point "
+            f"was outside the moving nest or could not be sampled."
+        )
 
     # Sort results by valid time (safety)
     results.sort(key=lambda r: r[0])
@@ -364,11 +457,14 @@ if __name__ == "__main__":
     cumulative_snowh20_list = []
 
     # Initialize previous cumulative rain/snow for rate calculation
-    previous_rain = 0.0
-    previous_snowh20 = 0.0
+    previous_time = None
+    previous_rain = None
+    previous_snowh20 = None
 
     # ----------------------------------------------------------------------
-    # Aggregate instantaneous values and compute 1-hr rates
+    # Aggregate instantaneous values and compute hourly rates from cumulative
+    # precipitation fields. Hourly output is unchanged; sub-hourly output is
+    # normalized to mm/hr.
     # ----------------------------------------------------------------------
     for i, (
         time,
@@ -384,14 +480,16 @@ if __name__ == "__main__":
     ) in enumerate(results):
         time_points.append(time)
 
-        # 1-hr rates from cumulative values (mm/hr), physics unchanged
-        if i > 0:
-            rain_rate = max(0.0, rain - previous_rain)
-            snowh20_rate = max(0.0, snowh20 - previous_snowh20)
-        else:
-            rain_rate = 0.0
-            snowh20_rate = 0.0
+        # Hourly rates from cumulative values (mm/hr)
+        rain_rate = safe_diff_rate(rain, previous_rain, time, previous_time)
+        snowh20_rate = safe_diff_rate(
+            snowh20,
+            previous_snowh20,
+            time,
+            previous_time,
+        )
 
+        previous_time = time
         previous_rain = rain
         previous_snowh20 = snowh20
 
@@ -562,8 +660,8 @@ if __name__ == "__main__":
     ax4_secondary = ax4_primary.twinx()
 
     time_nums = mdates.date2num(time_points)
-    bar_width = 0.01
-    offset = 0.006
+    bar_width = median_time_step_days(time_points)
+    offset = bar_width * 0.60
 
     bar_rain = ax4_primary.bar(
         time_nums - offset,

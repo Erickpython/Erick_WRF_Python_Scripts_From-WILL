@@ -30,7 +30,7 @@ Most common command
     d03 SanMarcos \
     29.8899 -97.9961 \
     --wrf-dir /home/workhorse/WRF_Intel/WRF-4.7.1/run \
-    --height-levels-m 100,500,1000
+    --height-levels-m 50, 100, 500, 1000, 2500, 5000
 
 Explicit launch-time example
 ----------------------------
@@ -41,7 +41,7 @@ Explicit launch-time example
     --start-time 2026-06-25_12:00:00 \
     --back-hours 12 \
     --forward-hours 12 \
-    --height-levels-m 100,500,1000
+    --height-levels-m 50, 100, 500, 1000, 2500, 5000
 
 Output files
 ------------
@@ -844,7 +844,18 @@ def integrate_trajectory(
     prev_lon = lon
 
     while True:
-        sample0 = sample_velocity_with_domain_fallback(domain_frame_sets, t, lat, lon, z_agl, field_source)
+        try:
+            sample0 = sample_velocity_with_domain_fallback(domain_frame_sets, t, lat, lon, z_agl, field_source)
+        except ValueError as exc:
+            if rows:
+                rows[-1]["trajectory_stop_reason"] = "outside_all_available_domains"
+                rows[-1]["integration_error"] = str(exc)
+                print(
+                    f"WARNING: stopping partial trajectory at step {step} because the parcel left all available WRF domains: {exc}"
+                )
+                break
+            raise
+
         surface_limited = False
         trajectory_stop_reason = ""
 
@@ -876,6 +887,7 @@ def integrate_trajectory(
                 "clipped_above_model": sample0.clipped_above_model,
                 "surface_limited_by_behavior": surface_limited,
                 "trajectory_stop_reason": trajectory_stop_reason,
+                "integration_error": "",
                 "u_east_mps": sample0.u_east_mps,
                 "v_north_mps": sample0.v_north_mps,
                 "w_mps": sample0.w_mps,
@@ -909,7 +921,17 @@ def integrate_trajectory(
         mid_lat, mid_lon, mid_z = advance_position(
             lat, lon, z_agl, sample0, step_seconds / 2.0, vertical_mode, vertical_floor_m, surface_behavior
         )
-        sample_mid = sample_velocity_with_domain_fallback(domain_frame_sets, half_t, mid_lat, mid_lon, mid_z, field_source)
+        try:
+            sample_mid = sample_velocity_with_domain_fallback(domain_frame_sets, half_t, mid_lat, mid_lon, mid_z, field_source)
+        except ValueError as exc:
+            if rows:
+                rows[-1]["trajectory_stop_reason"] = "outside_all_available_domains_midpoint"
+                rows[-1]["integration_error"] = str(exc)
+                print(
+                    f"WARNING: stopping partial trajectory at step {step} because the midpoint left all available WRF domains: {exc}"
+                )
+                break
+            raise
 
         prev_lat, prev_lon = lat, lon
         lat, lon, z_agl = advance_position(
@@ -1689,10 +1711,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  python3 WRF_Back_Forward_Trajectory.py d03 SanMarcos 29.8899 -97.9961 "
-            "--wrf-dir /home/workhorse/WRF_Intel/WRF-4.7.1/run --height-levels-m 100,500,1000\n\n"
+            "--wrf-dir /home/workhorse/WRF_Intel/WRF-4.7.1/run --height-levels-m 50, 100, 500, 1000, 2500, 5000\n\n"
             "  python3 WRF_Back_Forward_Trajectory.py d03 SanMarcos 29.8899 -97.9961 "
             "--wrf-dir /home/workhorse/WRF_Intel/WRF-4.7.1/run --start-time 2026-06-25_12:00:00 "
-            "--back-hours 12 --forward-hours 12 --height-levels-m 100,500,1000\n\n"
+            "--back-hours 12 --forward-hours 12 --height-levels-m 50, 100, 500, 1000, 2500, 5000\n\n"
             "For a full method description, read the USER HELP section at the top of this file."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1739,10 +1761,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height-agl-m", type=float, default=100.0, help=argparse.SUPPRESS)
     parser.add_argument(
         "--height-levels-m",
-        default="100,500,1000",
+        default="50, 100, 500, 1000, 2500, 5000",
         help=(
             "Comma-separated starting parcel heights in meters AGL. "
-            "Default is 100,500,1000."
+            "Default is 50, 100, 500, 1000, 2500, 5000."
         ),
     )
     parser.add_argument("--vertical-mode", choices=["passive_w"], default="passive_w", help=argparse.SUPPRESS)
@@ -2008,38 +2030,57 @@ def main() -> None:
     for point in launch_points:
         for start_height_agl_m in height_values:
             height_tag = safe_tag(f"{start_height_agl_m:g}mAGL")
-            df_back = integrate_trajectory(
-                domain_frame_sets=domain_frame_sets,
-                start_time_utc=start_time_utc,
-                start_lat=point['lat'],
-                start_lon=point['lon'],
-                start_height_agl_m=start_height_agl_m,
-                hours=args.back_hours,
-                dt_min=args.dt_min,
-                vertical_mode=args.vertical_mode,
-                field_source=args.field_source,
-                vertical_floor_m=args.vertical_floor_m,
-                surface_behavior=args.surface_behavior,
-                direction="backward",
-            )
-            df_forward = integrate_trajectory(
-                domain_frame_sets=domain_frame_sets,
-                start_time_utc=start_time_utc,
-                start_lat=point['lat'],
-                start_lon=point['lon'],
-                start_height_agl_m=start_height_agl_m,
-                hours=args.forward_hours,
-                dt_min=args.dt_min,
-                vertical_mode=args.vertical_mode,
-                field_source=args.field_source,
-                vertical_floor_m=args.vertical_floor_m,
-                surface_behavior=args.surface_behavior,
-                direction="forward",
-            )
-            df = pd.concat(
-                [df_back.iloc[::-1].copy(), df_forward.iloc[1:].copy()],
-                ignore_index=True,
-            )
+            try:
+                df_back = integrate_trajectory(
+                    domain_frame_sets=domain_frame_sets,
+                    start_time_utc=start_time_utc,
+                    start_lat=point['lat'],
+                    start_lon=point['lon'],
+                    start_height_agl_m=start_height_agl_m,
+                    hours=args.back_hours,
+                    dt_min=args.dt_min,
+                    vertical_mode=args.vertical_mode,
+                    field_source=args.field_source,
+                    vertical_floor_m=args.vertical_floor_m,
+                    surface_behavior=args.surface_behavior,
+                    direction="backward",
+                )
+                df_forward = integrate_trajectory(
+                    domain_frame_sets=domain_frame_sets,
+                    start_time_utc=start_time_utc,
+                    start_lat=point['lat'],
+                    start_lon=point['lon'],
+                    start_height_agl_m=start_height_agl_m,
+                    hours=args.forward_hours,
+                    dt_min=args.dt_min,
+                    vertical_mode=args.vertical_mode,
+                    field_source=args.field_source,
+                    vertical_floor_m=args.vertical_floor_m,
+                    surface_behavior=args.surface_behavior,
+                    direction="forward",
+                )
+            except ValueError as exc:
+                print(
+                    f"WARNING: skipping paired trajectory for {point['city']} at {start_height_agl_m:g} m AGL "
+                    f"because it could not be sampled on any available WRF domain: {exc}"
+                )
+                continue
+
+            if df_back.empty and df_forward.empty:
+                print(
+                    f"WARNING: skipping empty paired trajectory for {point['city']} at {start_height_agl_m:g} m AGL"
+                )
+                continue
+
+            pieces = []
+            if not df_back.empty:
+                pieces.append(df_back.iloc[::-1].copy())
+            if not df_forward.empty:
+                if pieces:
+                    pieces.append(df_forward.iloc[1:].copy())
+                else:
+                    pieces.append(df_forward.copy())
+            df = pd.concat(pieces, ignore_index=True)
             df.loc[np.isclose(df["age_hours"], 0.0), "trajectory_direction"] = "start"
             df = add_local_time_columns(df, args.tz)
             df.insert(0, 'city', point['city'])
